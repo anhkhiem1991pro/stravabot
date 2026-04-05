@@ -1,10 +1,10 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 
-// ─── Storage (saves user tokens + total km) ───────────────────────────────────
+// ─── Storage ──────────────────────────────────────────────────────────────────
 const DATA_FILE = './data.json';
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) return { users: {}, totalKm: 0 };
@@ -18,21 +18,70 @@ function saveData(data) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-client.once('ready', () => {
+// ─── Register Slash Commands ──────────────────────────────────────────────────
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('linkstrava')
+      .setDescription('Link your Strava account to the Discord bot')
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('totalkm')
+      .setDescription('See the total km ridden by everyone in the server')
+      .toJSON(),
+  ];
+
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
+    console.log('✅ Slash commands registered');
+  } catch (err) {
+    console.error('Error registering commands:', err);
+  }
+}
+
+// ─── Handle Slash Commands ────────────────────────────────────────────────────
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  // /linkstrava
+  if (interaction.commandName === 'linkstrava') {
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
+    const linkUrl = `${process.env.BASE_URL}/auth?discord_id=${userId}`;
+
+    await interaction.reply({
+      content:
+        `Hey **${username}**! Click the link below to connect your Strava account:\n` +
+        `🔗 ${linkUrl}\n\n` +
+        `Once you authorize it, the bot will automatically post your bike rides in the server!`,
+      ephemeral: true
+    });
+  }
+
+  // /totalkm
+  if (interaction.commandName === 'totalkm') {
+    const data = loadData();
+    await interaction.reply({
+      content: `🌍 The server has ridden a total of **${data.totalKm} km** combined!`,
+    });
+  }
+});
+
+client.once('ready', async () => {
   console.log(`✅ Discord bot logged in as ${client.user.tag}`);
+  await registerCommands();
 });
 
 client.login(process.env.DISCORD_TOKEN);
 
-// ─── Express Server (handles Strava OAuth + Webhooks) ─────────────────────────
+// ─── Express Server ───────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-// Step 1: Link Strava — user visits this URL in their browser
-// Usage: /auth?discord_id=YOUR_DISCORD_USER_ID
 app.get('/auth', (req, res) => {
   const discordId = req.query.discord_id;
-  if (!discordId) return res.send('Missing discord_id. Use /auth?discord_id=YOUR_DISCORD_ID');
+  if (!discordId) return res.send('Missing discord_id.');
 
   const authUrl =
     `https://www.strava.com/oauth/authorize` +
@@ -45,12 +94,10 @@ app.get('/auth', (req, res) => {
   res.redirect(authUrl);
 });
 
-// Step 2: Strava redirects here after user approves
 app.get('/callback', async (req, res) => {
   const { code, state: discordId } = req.query;
 
   try {
-    // Exchange code for tokens
     const response = await axios.post('https://www.strava.com/oauth/token', {
       client_id: process.env.STRAVA_CLIENT_ID,
       client_secret: process.env.STRAVA_CLIENT_SECRET,
@@ -61,7 +108,6 @@ app.get('/callback', async (req, res) => {
     const { access_token, refresh_token, athlete } = response.data;
     const athleteName = `${athlete.firstname} ${athlete.lastname}`;
 
-    // Save user data
     const data = loadData();
     data.users[athlete.id] = {
       discordId,
@@ -72,7 +118,6 @@ app.get('/callback', async (req, res) => {
     };
     saveData(data);
 
-    // Subscribe to Strava webhook if not already done
     await subscribeWebhook();
 
     res.send(`
@@ -82,11 +127,10 @@ app.get('/callback', async (req, res) => {
     `);
   } catch (err) {
     console.error('OAuth error:', err.response?.data || err.message);
-    res.send('❌ Something went wrong. Check your Strava app settings.');
+    res.send('❌ Something went wrong. Try again.');
   }
 });
 
-// Step 3: Strava webhook verification (one-time setup)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -100,13 +144,10 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Step 4: Strava sends activity events here
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
+  res.sendStatus(200);
 
   const event = req.body;
-
-  // Only care about new activities
   if (event.object_type !== 'activity' || event.aspect_type !== 'create') return;
 
   const stravaId = event.owner_id;
@@ -114,13 +155,11 @@ app.post('/webhook', async (req, res) => {
 
   const data = loadData();
   const user = data.users[stravaId];
-  if (!user) return; // user not linked
+  if (!user) return;
 
   try {
-    // Refresh token if needed
     const accessToken = await getValidToken(user, stravaId, data);
 
-    // Fetch activity details
     const actRes = await axios.get(
       `https://www.strava.com/api/v3/activities/${activityId}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -129,30 +168,26 @@ app.post('/webhook', async (req, res) => {
     const activity = actRes.data;
     const type = activity.type;
 
-    // Only post for bike rides
     const bikeTypes = ['Ride', 'VirtualRide', 'EBikeRide', 'MountainBikeRide', 'GravelRide'];
     if (!bikeTypes.includes(type)) return;
 
     const km = (activity.distance / 1000).toFixed(2);
     const label = type === 'VirtualRide' ? 'indoor bike ride' : 'bike ride';
 
-    // Update total
     data.totalKm = (parseFloat(data.totalKm) + parseFloat(km)).toFixed(2);
     saveData(data);
 
-    // Post to Discord
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
     await channel.send(
       `🚴 **${user.athleteName}** did a ${label} of **${km} km**!\n` +
       `🌍 Server total: **${data.totalKm} km**`
     );
-
   } catch (err) {
     console.error('Webhook error:', err.response?.data || err.message);
   }
 });
 
-// ─── Helper: Refresh Strava token if expired ──────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 async function getValidToken(user, stravaId, data) {
   try {
     const res = await axios.post('https://www.strava.com/oauth/token', {
@@ -170,7 +205,6 @@ async function getValidToken(user, stravaId, data) {
   }
 }
 
-// ─── Helper: Subscribe to Strava Webhook ──────────────────────────────────────
 async function subscribeWebhook() {
   try {
     await axios.post('https://www.strava.com/api/v3/push_subscriptions', {
@@ -181,7 +215,6 @@ async function subscribeWebhook() {
     });
     console.log('✅ Strava webhook subscribed');
   } catch (err) {
-    // Already subscribed is fine
     const msg = err.response?.data?.errors?.[0]?.message || '';
     if (!msg.includes('already')) {
       console.error('Webhook subscribe error:', err.response?.data || err.message);
@@ -189,6 +222,5 @@ async function subscribeWebhook() {
   }
 }
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));

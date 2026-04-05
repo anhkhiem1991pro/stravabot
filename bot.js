@@ -25,10 +25,6 @@ async function registerCommands() {
       .setName('linkstrava')
       .setDescription('Link your Strava account to the Discord bot')
       .toJSON(),
-    new SlashCommandBuilder()
-      .setName('totalkm')
-      .setDescription('See the total km ridden by everyone in the server')
-      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -56,14 +52,6 @@ client.on('interactionCreate', async (interaction) => {
         `🔗 ${linkUrl}\n\n` +
         `Once you authorize it, the bot will automatically post your bike rides in the server!`,
       ephemeral: true
-    });
-  }
-
-  // /totalkm
-  if (interaction.commandName === 'totalkm') {
-    const data = loadData();
-    await interaction.reply({
-      content: `🌍 The server has ridden a total of **${data.totalKm} km** combined!`,
     });
   }
 });
@@ -174,13 +162,9 @@ app.post('/webhook', async (req, res) => {
     const km = (activity.distance / 1000).toFixed(2);
     const label = type === 'VirtualRide' ? 'indoor bike ride' : 'bike ride';
 
-    data.totalKm = (parseFloat(data.totalKm) + parseFloat(km)).toFixed(2);
-    saveData(data);
-
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
     await channel.send(
-      `🚴 **${user.athleteName}** did a ${label} of **${km} km**!\n` +
-      `🌍 Server total: **${data.totalKm} km**`
+      `🚴 **${user.athleteName}** did a ${label} of **${km} km**!`
     );
   } catch (err) {
     console.error('Webhook error:', err.response?.data || err.message);
